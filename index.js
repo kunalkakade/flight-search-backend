@@ -5,13 +5,16 @@ const cors = require('cors');
 const stripe = require("stripe")("sk_test_51PlTskDI9pAomXvvgLmOKrdvkQUfzGBqbJf9uEjfXke5Zx8AhHy0CjCwNVap6ISguK4B8LPM2h900H8aiUSaJEVv00JDg0AE16");
 
 // Enable CORS for all routes
-app.use(cors({
-  origin: 'http://localhost:3002' // Allow only your React app's origin
-}));
 
-app.use(cors({
-  origin: ['http://localhost:3002', 'https://main.dcexb3b1fce9g.amplifyapp.com']
-}));
+const corsOptions = {
+  origin: [
+    'http://localhost:3002',
+    'https://main.dcexb3b1fce9g.amplifyapp.com'
+  ],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json());
 

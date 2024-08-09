@@ -8,6 +8,11 @@ const stripe = require("stripe")("sk_test_51PlTskDI9pAomXvvgLmOKrdvkQUfzGBqbJf9u
 app.use(cors({
   origin: 'http://localhost:3002' // Allow only your React app's origin
 }));
+
+app.use(cors({
+  origin: ['http://localhost:3002', 'https://main.dcexb3b1fce9g.amplifyapp.com']
+}));
+
 app.use(express.json());
 
 app.get('/test', (req, res) => {

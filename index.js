@@ -1,8 +1,14 @@
+require('dotenv').config(); 
 const express = require("express");
 const app = express();
 const port = process.env.PORT || 3001;
 const cors = require('cors');
-const stripe = require("stripe")("sk_test_51PlTskDI9pAomXvvgLmOKrdvkQUfzGBqbJf9uEjfXke5Zx8AhHy0CjCwNVap6ISguK4B8LPM2h900H8aiUSaJEVv00JDg0AE16");
+const Amadeus = require('amadeus');
+const NodeCache = require('node-cache');
+const stripe = require("stripe")(process.env.STRIP_SECRET);
+const SerpApi = require('google-search-results-nodejs');
+const search = new SerpApi.GoogleSearch(process.env.SERPAPI_KEY);
+
 
 // Enable CORS for all routes
 
@@ -18,6 +24,24 @@ app.use(cors(corsOptions));
 
 app.use(express.json());
 
+let amadeus;
+try {
+  if (!process.env.AMADEUS_API_KEY || !process.env.AMADEUS_API_SECRET) {
+    throw new Error('Amadeus API credentials are missing in environment variables');
+  }
+  amadeus = new Amadeus({
+    clientId: process.env.AMADEUS_API_KEY,
+    clientSecret: process.env.AMADEUS_API_SECRET
+  });
+  console.log('Amadeus client initialized successfully');
+} catch (error) {
+  console.error('Failed to initialize Amadeus client:', error.message);
+  process.exit(1); // Exit the process if Amadeus client can't be initialized
+}
+
+const cache = new NodeCache({ stdTTL: 3600 }); // Cache for 1 hour
+
+
 app.get('/test', (req, res) => {
   console.log("test called")
   res.json({ 
@@ -25,6 +49,227 @@ app.get('/test', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+
+app.post('/serp-flight-search', async (req, res) => {
+  try {
+    const { originCode, destinationCode, departureDate, returnDate, roundTrip } = req.body;
+
+    if (!originCode || !destinationCode || !departureDate) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    // Create a cache key based on the search parameters
+    let cacheKey;
+    if (roundTrip) {
+      cacheKey = `serp_flight_roundtrip_${originCode}_${destinationCode}_${departureDate}_${returnDate}`;
+    } else {
+      cacheKey = `serp_flight_oneway_${originCode}_${destinationCode}_${departureDate}`;
+    }
+
+    // Check if we have cached results
+    let flightData = cache.get(cacheKey);
+    
+    if (flightData) {
+      // If cached data exists, return it immediately
+      return res.json({ data: flightData, fromCache: true });
+    }
+
+    // If not in cache, fetch from SerpApi
+    const params = {
+      engine: "google_flights",
+      departure_id: originCode,
+      arrival_id: destinationCode,
+      outbound_date: departureDate,
+      ...(roundTrip && returnDate ? { return_date: returnDate } : {}),
+      ...(roundTrip ? { type: 1 } : { type: 2 })
+    };
+
+    search.json(params, (data) => {
+      if (data.error) {
+        res.status(500).json({ error: data.error });
+      } else {
+        // Store the results in cache
+        cache.set(cacheKey, data);
+        res.json({ data: data, fromCache: false });
+      }
+    });
+  } catch (error) {
+    console.error('Error searching flights with SerpApi:', error);
+    res.status(500).json({ error: 'An error occurred while searching for flights.' });
+  }
+});
+
+
+
+
+app.post('/search-flights', async (req, res) => {
+  try {
+    const { 
+      originCode, 
+      destinationCode, 
+      departureDate, 
+      adults,
+      maxPrice,
+      maxStops,
+      airlines
+    } =  req.body;
+
+    // Create a cache key based on the search parameters
+    const cacheKey = `${originCode}-${destinationCode}-${departureDate}`;
+
+    // Check if we have cached results
+    let flightData = cache.get(cacheKey);
+    let fromCache = true;
+    let flightDataLength = 0
+    //flightData === undefined
+    if (true) {
+      // If not in cache, fetch from Amadeus API
+      const response = await amadeus.shopping.flightOffersSearch.get({
+        originLocationCode: originCode,
+        destinationLocationCode: destinationCode,
+        departureDate: departureDate,
+        adults: adults || '1',
+        max: 100 // Increased to allow for more filtering options
+      });
+
+      flightData = response.data;
+      flightDataLength = response.data.length;
+      fromCache = false;
+
+      // Store the results in cache
+      cache.set(cacheKey, flightData);
+    }
+
+    // Apply filters (this part remains the same as it's cheap to do client-side)
+    let filteredFlights = flightData;
+
+    if (maxPrice) {
+      filteredFlights = filteredFlights.filter(flight => parseFloat(flight.price.total) <= parseFloat(maxPrice));
+    }
+
+    if (maxStops) {
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.itineraries[0].segments.length - 1 <= parseInt(maxStops)
+      );
+    }
+
+    if (airlines) {
+      const airlineList = airlines.split(',');
+      filteredFlights = filteredFlights.filter(flight => 
+        flight.itineraries[0].segments.some(segment => 
+          airlineList.includes(segment.carrierCode)
+        )
+      );
+    }
+
+    res.json({data:filteredFlights.slice(0, 20), fromCache, flightDataLength}); // Limit to 20 results after filtering
+  } catch (error) {
+    console.error('Error searching flights:', error);
+    res.status(500).json({ error: error.message || 'An error occurred while searching for flights.' });
+  }
+});
+
+// New endpoint to clear cache (for admin use or scheduled tasks)
+app.post('/clear-cache', (req, res) => {
+  cache.flushAll();
+  res.json({ message: 'Cache cleared successfully' });
+});
+
+
+
+
+
+app.get('/airports', async (req, res) => {
+  try {
+    const keyword = req.query.keyword || '';
+
+    // If no keyword is provided, return an empty array or cached results
+    if (!keyword) {
+      const cachedAirports = cache.get('airports') || [];
+      return res.json(cachedAirports);
+    }
+
+    // Check for cached results for this specific keyword
+    const cacheKey = `airports_${keyword}`;
+    const cachedResults = cache.get(cacheKey);
+    if (cachedResults) {
+      return res.json(cachedResults);
+    }
+
+    const response = await amadeus.referenceData.locations.get({
+      subType: 'AIRPORT',
+      keyword: keyword,
+      sort: 'analytics.travelers.score',
+      view: 'FULL'
+    });
+
+    const airports = response.data.map(airport => ({
+      iataCode: airport.iataCode,
+      name: airport.name,
+      cityName: airport.address.cityName,
+      countryName: airport.address.countryName
+    }));
+
+    // Cache the results for this keyword
+    cache.set(cacheKey, airports);
+    res.json(airports);
+  } catch (error) {
+    console.error('Error fetching airports:', error);
+    res.status(500).json({ error: 'Failed to fetch airports' });
+  }
+});
+
+// New endpoint to get airlines
+app.get('/airlines', async (req, res) => {
+  try {
+    const cachedAirlines = cache.get('airlines');
+    if (cachedAirlines) {
+      return res.json(cachedAirlines);
+    }
+
+    const response = await amadeus.referenceData.airlines.get();
+
+    const airlines = response.data.map(airline => ({
+      iataCode: airline.iataCode,
+      name: airline.businessName
+    }));
+
+    cache.set('airlines', airlines);
+    res.json(airlines);
+  } catch (error) {
+    console.error('Error fetching airlines:', error);
+    res.status(500).json({ error: 'Failed to fetch airlines' });
+  }
+});
+
+app.get('/search-airports', async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword || keyword.length < 2) {
+      return res.status(400).json({ error: 'Keyword must be at least 2 characters long' });
+    }
+
+    const response = await amadeus.referenceData.locations.get({
+      keyword,
+      subType: Amadeus.location.AIRPORT,
+      page: { limit: 10 }
+    });
+
+    const airports = response.data.map(airport => ({
+      iataCode: airport.iataCode,
+      name: airport.name,
+      cityName: airport.address.cityName,
+      countryName: airport.address.countryName
+    }));
+
+    res.json(airports);
+  } catch (error) {
+    console.error('Error searching airports:', error);
+    res.status(500).json({ error: 'Failed to search airports', details: error.response?.body || error.message });
+  }
+});
+
 
 
 app.post("/create-payment-intent", async (req, res) => {

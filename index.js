@@ -104,7 +104,6 @@ app.post('/serp-flight-search', async (req, res) => {
 
 
 
-
 app.post('/search-flights', async (req, res) => {
   try {
     const { 
@@ -114,26 +113,36 @@ app.post('/search-flights', async (req, res) => {
       adults,
       maxPrice,
       maxStops,
-      airlines
-    } =  req.body;
+      airlines,
+      returnDate,
+      roundTrip
+    } = req.body;
 
     // Create a cache key based on the search parameters
-    const cacheKey = `${originCode}-${destinationCode}-${departureDate}`;
+    const cacheKey = `${originCode}-${destinationCode}-${departureDate}${roundTrip ? `-${returnDate}` : ''}-AED`;
 
     // Check if we have cached results
     let flightData = cache.get(cacheKey);
     let fromCache = true;
-    let flightDataLength = 0
-    //flightData === undefined
-    if (true) {
+    let flightDataLength = 0;
+
+    if (!flightData) {
       // If not in cache, fetch from Amadeus API
-      const response = await amadeus.shopping.flightOffersSearch.get({
+      const searchParams = {
         originLocationCode: originCode,
         destinationLocationCode: destinationCode,
         departureDate: departureDate,
         adults: adults || '1',
+        currencyCode: 'AED', // Request prices in AED
         max: 100 // Increased to allow for more filtering options
-      });
+      };
+
+      // Add returnDate for round-trip flights
+      if (roundTrip && returnDate) {
+        searchParams.returnDate = returnDate;
+      }
+
+      const response = await amadeus.shopping.flightOffersSearch.get(searchParams);
 
       flightData = response.data;
       flightDataLength = response.data.length;
@@ -143,7 +152,7 @@ app.post('/search-flights', async (req, res) => {
       cache.set(cacheKey, flightData);
     }
 
-    // Apply filters (this part remains the same as it's cheap to do client-side)
+    // Apply filters
     let filteredFlights = flightData;
 
     if (maxPrice) {
@@ -152,25 +161,35 @@ app.post('/search-flights', async (req, res) => {
 
     if (maxStops) {
       filteredFlights = filteredFlights.filter(flight => 
-        flight.itineraries[0].segments.length - 1 <= parseInt(maxStops)
+        flight.itineraries.every(itinerary => itinerary.segments.length - 1 <= parseInt(maxStops))
       );
     }
 
     if (airlines) {
       const airlineList = airlines.split(',');
       filteredFlights = filteredFlights.filter(flight => 
-        flight.itineraries[0].segments.some(segment => 
-          airlineList.includes(segment.carrierCode)
+        flight.itineraries.every(itinerary =>
+          itinerary.segments.some(segment => airlineList.includes(segment.carrierCode))
         )
       );
     }
 
-    res.json({data:filteredFlights.slice(0, 20), fromCache, flightDataLength}); // Limit to 20 results after filtering
+    // Sort flights by price (ascending order)
+    filteredFlights.sort((a, b) => parseFloat(a.price.total) - parseFloat(b.price.total));
+
+    res.json({
+      data: filteredFlights,
+      fromCache,
+      flightDataLength,
+      roundTrip: !!roundTrip,
+      currency: 'AED'
+    });
   } catch (error) {
     console.error('Error searching flights:', error);
     res.status(500).json({ error: error.message || 'An error occurred while searching for flights.' });
   }
 });
+
 
 // New endpoint to clear cache (for admin use or scheduled tasks)
 app.post('/clear-cache', (req, res) => {

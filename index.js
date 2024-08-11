@@ -81,6 +81,8 @@ app.post('/serp-flight-search', async (req, res) => {
       departure_id: originCode,
       arrival_id: destinationCode,
       outbound_date: departureDate,
+      "currency":"AED",
+      "show_hidden":true,
       ...(roundTrip && returnDate ? { return_date: returnDate } : {}),
       ...(roundTrip ? { type: 1 } : { type: 2 })
     };

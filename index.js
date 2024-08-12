@@ -102,6 +102,57 @@ app.post('/serp-flight-search', async (req, res) => {
   }
 });
 
+app.post('/serp-return-flight-search', async (req, res) => {
+  try {
+    const { 
+      originCode, 
+      destinationCode, 
+      departureDate, 
+      returnDate, 
+      departureToken 
+    } = req.body;
+
+    if (!originCode || !destinationCode || !departureDate || !returnDate || !departureToken) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    // Create a cache key based on the search parameters
+    const cacheKey = `serp_return_flight_${originCode}_${destinationCode}_${departureDate}_${returnDate}_${departureToken}`;
+
+    // Check if we have cached results
+    let flightData = cache.get(cacheKey);
+    
+    if (flightData) {
+      // If cached data exists, return it immediately
+      return res.json({ data: flightData, fromCache: true });
+    }
+
+    // If not in cache, fetch from SerpApi
+    const params = {
+      engine: "google_flights",
+      departure_id: originCode,
+      arrival_id:  destinationCode,
+      return_date: returnDate,
+      outbound_date:departureDate,
+      departure_token: departureToken,
+      currency: "AED"
+    };
+
+    search.json(params, (data) => {
+      if (data.error) {
+        console.log("error:  ", data)
+        res.status(500).json({ error: data.error });
+      } else {
+        // Store the results in cache
+        cache.set(cacheKey, data);
+        res.json({ data: data, fromCache: false });
+      }
+    });
+  } catch (error) {
+    console.error('Error searching return flights with SerpApi:', error);
+    res.status(500).json({ error: 'An error occurred while searching for return flights.' });
+  }
+});
 
 
 app.post('/search-flights', async (req, res) => {
@@ -306,25 +357,6 @@ app.post("/create-payment-intent", async (req, res) => {
   }
 });
 
-
-app.post('/create-invoice-session', async (req, res) => {
-  try {
-    const { invoiceId } = req.body;
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      invoice: invoiceId,
-      success_url: 'http://localhost:3001/success',
-      cancel_url: 'http://localhost:3001/cancel',
-    });
-
-    res.json({ sessionId: session.id });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // New endpoint to retrieve an invoice
 app.get('/invoice/:invoiceId', async (req, res) => {
   try {
@@ -365,4 +397,149 @@ app.post('/webhook', express.raw({type: 'application/json'}), (request, response
 
 app.listen(port, () => {
   console.log("Server is listening on port 3001");
+});
+
+app.post('/create-checkout-session', async (req, res) => {
+  try {
+    const { flight, returnFlight } = req.body;
+
+    // Function to format date
+    const formatDate = (dateString) => {
+      const date = new Date(dateString);
+      return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    };
+
+    // Function to get flight details based on source
+    const getFlightDetails = (flightData, isReturn = false) => {
+      if (flightData.source === 'amadeus') {
+        const segment = isReturn ? flightData.segments[1][0] : flightData.segments[0][0];
+        return {
+          departure: segment.departure,
+          arrival: segment.arrival,
+          airline: segment.airlineName,
+          flightNumber: segment.flightNumber,
+          travelClass: flightData.travelClass
+        };
+      } else { // Assume SERP structure
+        if (isReturn && returnFlight) {
+          return {
+            departure: {
+              airport: returnFlight.flights[0].departure_airport.id,
+              time: returnFlight.flights[0].departure_airport.time
+            },
+            arrival: {
+              airport: returnFlight.flights[0].arrival_airport.id,
+              time: returnFlight.flights[0].arrival_airport.time
+            },
+            airline: returnFlight.flights[0].airline,
+            flightNumber: returnFlight.flights[0].flight_number,
+            travelClass: returnFlight.flights[0].travel_class
+          };
+        } else {
+          const segment = flightData.segments[0][0];
+          return {
+            departure: segment.departure,
+            arrival: segment.arrival,
+            airline: segment.airlineName,
+            flightNumber: segment.flightNumber,
+            travelClass: flightData.travelClass
+          };
+        }
+      }
+    };
+
+    const outboundFlight = getFlightDetails(flight);
+    const isRoundTrip = flight.source === 'amadeus' ? flight.segments.length > 1 : returnFlight !== null;
+    const returnFlightDetails = isRoundTrip ? getFlightDetails(flight.source === 'amadeus' ? flight : returnFlight, true) : null;
+
+    // Create product name
+    let productName = `Flight: ${outboundFlight.departure.airport} to ${outboundFlight.arrival.airport}`;
+    if (isRoundTrip) {
+      productName += ` (Round Trip)`;
+    }
+
+    // Create product description
+    let description = `Outbound: ${outboundFlight.departure.airport} to ${outboundFlight.arrival.airport} on ${formatDate(outboundFlight.departure.time)}`;
+    if (isRoundTrip) {
+      description += `\nReturn: ${returnFlightDetails.departure.airport} to ${returnFlightDetails.arrival.airport} on ${formatDate(returnFlightDetails.departure.time)}`;
+    }
+
+    // Add more details to the description
+    description += `\nAirline: ${outboundFlight.airline}`;
+    description += `\nFlight Number: ${outboundFlight.flightNumber}`;
+    description += `\nClass: ${outboundFlight.travelClass}`;
+    if (isRoundTrip) {
+      description += `\nReturn Airline: ${returnFlightDetails.airline}`;
+      description += `\nReturn Flight Number: ${returnFlightDetails.flightNumber}`;
+      description += `\nReturn Class: ${returnFlightDetails.travelClass}`;
+    }
+
+    // Create a product for this flight
+    const product = await stripe.products.create({
+      name: productName,
+      description: description,
+    });
+
+    // Calculate total price
+    const totalPrice = isRoundTrip && flight.source !== 'amadeus'
+      ? (flight.price + returnFlight.price) * 100 // Convert to cents
+      : flight.price * 100;
+
+    // Create a price for the product
+    const price = await stripe.prices.create({
+      product: product.id,
+      unit_amount: totalPrice,
+      currency: flight.currency,
+    });
+
+    // Prepare metadata
+    const metadata = {
+      flight_type: isRoundTrip ? 'round_trip' : 'one_way',
+      outbound_from: outboundFlight.departure.airport,
+      outbound_to: outboundFlight.arrival.airport,
+      outbound_date: formatDate(outboundFlight.departure.time),
+      outbound_airline: outboundFlight.airline,
+      outbound_flight_number: outboundFlight.flightNumber,
+      outbound_class: outboundFlight.travelClass,
+      data_source: flight.source
+    };
+
+    if (isRoundTrip) {
+      metadata.return_from = returnFlightDetails.departure.airport;
+      metadata.return_to = returnFlightDetails.arrival.airport;
+      metadata.return_date = formatDate(returnFlightDetails.departure.time);
+      metadata.return_airline = returnFlightDetails.airline;
+      metadata.return_flight_number = returnFlightDetails.flightNumber;
+      metadata.return_class = returnFlightDetails.travelClass;
+    }
+
+    // Create a checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: price.id,
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/cancel`,
+      metadata: metadata
+    });
+
+    res.json({ sessionId: session.id });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ error: 'An error occurred while creating the checkout session.' });
+  }
+});
+app.get('/checkout-session', async (req, res) => {
+  const { sessionId } = req.query;
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    res.json(session);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
